@@ -1,0 +1,19 @@
+# Claude
+.claude/
+
+# CMake build
+build/
+
+# Python extension build artifacts
+*.so
+*.egg-info/
+dist/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+compile_commands.json
+
+# Test output
+*.pftrace
