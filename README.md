@@ -54,6 +54,26 @@ Environment variables (optional):
 - `KINETO_ROOT` — path to Kineto source (default: `/root/workspace/code/kineto`)
 - `PERFETTO_SDK` — path to Perfetto amalgamated SDK (default: `/root/workspace/code/perfetto_sdk`)
 
+### Making the module importable
+
+After building, you need the `.so` file on Python's import path. Several options:
+
+**Option A: pip install** (recommended)
+```bash
+pip install -e .
+```
+Note: `uv pip install` may fail because `setup.py` imports `torch` at the top level and `uv` uses an isolated build environment where `torch` is not available. Use `pip install` directly instead.
+
+**Option B: Add to PYTHONPATH**
+```bash
+export PYTHONPATH=/path/to/vllm_activity_logger:$PYTHONPATH
+```
+
+**Option C: Copy the .so to your working directory**
+```bash
+cp perfetto_logger.cpython-*.so /path/to/your/project/
+```
+
 ## Usage with PyTorch
 
 ```python
