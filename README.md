@@ -1,14 +1,16 @@
 # Perfetto Logger for Kineto
 
+THIS PROJECT IS CURRENTLY FOR DEMONSTRATION PURPOSES ONLY
+
 A standalone `ActivityLogger` implementation that outputs Perfetto protobuf (`.pftrace`) trace files from PyTorch/Kineto profiling sessions. Traces can be viewed in the [Perfetto UI](https://ui.perfetto.dev).
 
 ## Dependencies
 
 | Dependency | Purpose | Location |
 |---|---|---|
-| **Perfetto SDK** (v56.0) | Amalgamated C++ SDK for protobuf trace writing (`perfetto.h`, `perfetto.cc`) | `/root/workspace/code/perfetto_sdk/` |
-| **Kineto** | Public headers only (`libkineto/include/`) — defines the `ActivityLogger` interface | `/root/workspace/code/kineto/` |
-| **PyTorch** | For building the Python extension that registers the logger at runtime | `/root/workspace/code/pytorch/` |
+| **Perfetto SDK** (v56.0) | Amalgamated C++ SDK for protobuf trace writing (`perfetto.h`, `perfetto.cc`) | `perfetto_sdk/` |
+| **Kineto** | Public headers only (`libkineto/include/`) — defines the `ActivityLogger` interface | `kineto/` |
+| **PyTorch** | For building the Python extension that registers the logger at runtime | `pytorch/` |
 | **fmt** (>=10.x) | Required by Kineto's `GenericTraceActivity.h` — fetched automatically by CMake | auto |
 
 ### PyTorch Patch Requirements
@@ -43,7 +45,6 @@ cmake --build build -j8
 ### Python Extension — for use with PyTorch profiler
 
 ```bash
-source /root/workspace/code/pytorch/.venv/bin/activate
 cd vllm_activity_logger
 python setup.py build_ext --inplace
 ```
@@ -51,8 +52,8 @@ python setup.py build_ext --inplace
 This produces `perfetto_logger.cpython-*.so` in the project directory.
 
 Environment variables (optional):
-- `KINETO_ROOT` — path to Kineto source (default: `/root/workspace/code/kineto`)
-- `PERFETTO_SDK` — path to Perfetto amalgamated SDK (default: `/root/workspace/code/perfetto_sdk`)
+- `KINETO_ROOT` — path to Kineto source (default: `kineto`)
+- `PERFETTO_SDK` — path to Perfetto amalgamated SDK (default: `perfetto_sdk`)
 
 ## Usage with PyTorch
 
