@@ -247,7 +247,18 @@ bool PerfettoLogger::processCollapse(
       }
       return false;  // non-matching descendant: emit but keep collapse active
     }
-    // relative_depth <= 1: at or above root level — flush and try new rules
+    // relative_depth <= 1: sibling or higher of collapse root
+    if (nameMatchesPrefixes(name, rule.prefixes)) {
+      // Sibling extends the existing collapse
+      state.match_start_depth = depth;
+      state.matched_depth = 1;
+      state.collapse_end_ts = std::max(state.collapse_end_ts, end_ts);
+      if (py_id != 0) {
+        pythonIdRemap_[py_id] = state.collapse_python_id;
+      }
+      return true;  // suppress
+    }
+    // Non-matching at root level — flush and try new rules
     flushCollapse(track_key, state);
     for (auto& r : collapseRules_) {
       if (ruleCanStartWith(r, name)) {

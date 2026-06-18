@@ -476,5 +476,112 @@ int main() {
   std::cout << "All torch_*/autograd_* events should be suppressed." << std::endl;
   std::cout << "Open in https://ui.perfetto.dev to inspect." << std::endl;
 
+  // =====================================================================
+  // Test 4: STRICT_PATTERN + PREFIX_SET combined — collapse ["a","b"] to
+  //         "start", then collapse sibling "e_" events to "e"
+  //         Input tree:  [a,[b,[c,[d,[e_1,e_2,[e_21,e_22],f]]]]]
+  //         Expected:    [start,[c,[d,[e,f]]]]
+  // =====================================================================
+  static const std::string kCombinedOutput = "/tmp/test_combined_collapse_trace.pftrace";
+  std::cout << "\n--- Combined STRICT + PREFIX_SET collapse test ---" << std::endl;
+
+  auto mlogger = std::make_unique<perfetto_logger::PerfettoLogger>(kCombinedOutput);
+  mlogger->addCollapseRule(
+      {perfetto_logger::CollapseRule::STRICT_PATTERN,
+       {"a", "b"}, {}, "start"});
+  mlogger->addCollapseRule(
+      {perfetto_logger::CollapseRule::PREFIX_SET,
+       {}, {"e_"}, "e"});
+
+  std::unordered_map<std::string, std::string> mmeta;
+  mlogger->handleTraceStart(mmeta, "[]");
+
+  libkineto::DeviceInfo mdev{12345, 0, "process", "CPU"};
+  mlogger->handleDeviceInfo(mdev, 0);
+  libkineto::ResourceInfo mres{42, 0, 12345, "thread 42"};
+  mlogger->handleResourceInfo(mres, 0);
+
+  libkineto::TraceSpan mspan(0, 0, "test");
+
+  // a: 100..1000
+  {
+    libkineto::GenericTraceActivity act(mspan, libkineto::ActivityType::PYTHON_FUNCTION, "a");
+    act.startTime = 100; act.endTime = 1000;
+    act.device = 12345; act.resource = 42;
+    act.log(*mlogger);
+  }
+  // b: 100..900 (child of a — completes STRICT_PATTERN)
+  {
+    libkineto::GenericTraceActivity act(mspan, libkineto::ActivityType::PYTHON_FUNCTION, "b");
+    act.startTime = 100; act.endTime = 900;
+    act.device = 12345; act.resource = 42;
+    act.log(*mlogger);
+  }
+  // c: 100..800 (should be EMITTED, nested under "start" by time)
+  {
+    libkineto::GenericTraceActivity act(mspan, libkineto::ActivityType::PYTHON_FUNCTION, "c");
+    act.startTime = 100; act.endTime = 800;
+    act.device = 12345; act.resource = 42;
+    act.log(*mlogger);
+  }
+  // d: 100..700
+  {
+    libkineto::GenericTraceActivity act(mspan, libkineto::ActivityType::PYTHON_FUNCTION, "d");
+    act.startTime = 100; act.endTime = 700;
+    act.device = 12345; act.resource = 42;
+    act.log(*mlogger);
+  }
+  // e_1: 100..200 (starts PREFIX_SET collapse)
+  {
+    libkineto::GenericTraceActivity act(mspan, libkineto::ActivityType::PYTHON_FUNCTION, "e_1");
+    act.startTime = 100; act.endTime = 200;
+    act.device = 12345; act.resource = 42;
+    act.log(*mlogger);
+  }
+  // e_2: 210..400 (sibling, extends PREFIX_SET collapse)
+  {
+    libkineto::GenericTraceActivity act(mspan, libkineto::ActivityType::PYTHON_FUNCTION, "e_2");
+    act.startTime = 210; act.endTime = 400;
+    act.device = 12345; act.resource = 42;
+    act.log(*mlogger);
+  }
+  // e_21: 210..300 (child of e_2, suppressed)
+  {
+    libkineto::GenericTraceActivity act(mspan, libkineto::ActivityType::PYTHON_FUNCTION, "e_21");
+    act.startTime = 210; act.endTime = 300;
+    act.device = 12345; act.resource = 42;
+    act.log(*mlogger);
+  }
+  // e_22: 310..390 (child of e_2, suppressed)
+  {
+    libkineto::GenericTraceActivity act(mspan, libkineto::ActivityType::PYTHON_FUNCTION, "e_22");
+    act.startTime = 310; act.endTime = 390;
+    act.device = 12345; act.resource = 42;
+    act.log(*mlogger);
+  }
+  // f: 410..500 (non-matching sibling, breaks PREFIX_SET → EMITTED)
+  {
+    libkineto::GenericTraceActivity act(mspan, libkineto::ActivityType::PYTHON_FUNCTION, "f");
+    act.startTime = 410; act.endTime = 500;
+    act.device = 12345; act.resource = 42;
+    act.log(*mlogger);
+  }
+
+  libkineto::Config mconfig;
+  std::unordered_map<std::string, std::vector<std::string>> mfinalMeta;
+  mlogger->finalizeTrace(mconfig, nullptr, 1100, mfinalMeta);
+
+  std::ifstream mcheck(kCombinedOutput, std::ios::binary | std::ios::ate);
+  if (!mcheck.is_open()) {
+    std::cerr << "FAIL: Combined output not created" << std::endl;
+    return 1;
+  }
+  auto msize = mcheck.tellg();
+  std::cout << "OK: Combined trace wrote " << msize << " bytes to " << kCombinedOutput << std::endl;
+  std::cout << "Expected: 'start' (100..1000) > c (100..800) > d (100..700) > 'e' (100..400) + f (410..500)" << std::endl;
+  std::cout << "e_1, e_2, e_21, e_22 should all be suppressed into single 'e'." << std::endl;
+  std::cout << "a, b should be suppressed into 'start'." << std::endl;
+  std::cout << "Open in https://ui.perfetto.dev to inspect." << std::endl;
+
   return 0;
 }
