@@ -172,30 +172,44 @@ bool PerfettoLogger::processCollapse(
 
   // Pop expired events from the stack
   while (!state.stack.empty() && state.stack.back().end_ts <= ts) {
-    if (state.active_rule &&
-        static_cast<int>(state.stack.size()) == state.match_start_depth) {
-      if (state.active_rule->mode == CollapseRule::PREFIX_SET) {
-        // PREFIX_SET: defer flush — a sibling at the same depth might
-        // extend the collapse. Update end time and mark as pending.
-        state.collapse_end_ts = std::max(
-            state.collapse_end_ts, state.stack.back().end_ts);
+    int current_depth = static_cast<int>(state.stack.size());
+
+    if (!state.contexts.empty() &&
+        state.contexts.back().match_start_depth == current_depth) {
+      auto& ctx = state.contexts.back();
+      if (ctx.rule->mode == CollapseRule::PREFIX_SET) {
+        // Defer flush — a sibling at the same depth might extend it
+        ctx.collapse_end_ts = std::max(
+            ctx.collapse_end_ts, state.stack.back().end_ts);
         state.stack.pop_back();
-        state.matched_depth = 0;
-        // Don't clear active_rule yet — wait to see if next event matches
-        continue;
+        ctx.matched_depth = 0;
+      } else {
+        // STRICT_PATTERN: flush immediately
+        flushCollapse(track_key, state);
+        state.stack.pop_back();
       }
-      // STRICT_PATTERN: flush immediately
+    } else {
+      state.stack.pop_back();
+    }
+
+    // Flush contexts whose root can no longer receive siblings
+    while (!state.contexts.empty()) {
+      int gap = state.contexts.back().match_start_depth -
+                static_cast<int>(state.stack.size());
+      if (gap <= 1) break;
       flushCollapse(track_key, state);
     }
-    state.stack.pop_back();
-    // Adjust matched_depth if we popped matched entries
-    if (state.active_rule) {
-      int current_relative = static_cast<int>(state.stack.size()) - state.match_start_depth + 1;
-      if (current_relative < state.matched_depth) {
-        state.matched_depth = std::max(current_relative, 0);
-        if (state.matched_depth <= 0 &&
-            state.active_rule->mode != CollapseRule::PREFIX_SET) {
-          state.active_rule = nullptr;
+
+    // Adjust matched_depth for the innermost context
+    if (!state.contexts.empty()) {
+      auto& ctx = state.contexts.back();
+      int current_relative =
+          static_cast<int>(state.stack.size()) - ctx.match_start_depth + 1;
+      if (current_relative < ctx.matched_depth) {
+        ctx.matched_depth = std::max(current_relative, 0);
+        if (ctx.matched_depth <= 0 &&
+            ctx.rule->mode != CollapseRule::PREFIX_SET) {
+          flushCollapse(track_key, state);
         }
       }
     }
@@ -209,124 +223,135 @@ bool PerfettoLogger::processCollapse(
   state.stack.push_back({name, ts, end_ts, py_id, py_parent});
   int depth = static_cast<int>(state.stack.size());
 
-  // If no active rule, try to start a match
-  if (!state.active_rule) {
-    for (auto& rule : collapseRules_) {
-      if (ruleCanStartWith(rule, name)) {
-        state.active_rule = &rule;
-        state.match_start_depth = depth;
-        state.matched_depth = 1;
-        state.collapse_start_ts = ts;
-        state.collapse_end_ts = end_ts;
-        state.collapse_python_id = py_id;
-        state.collapse_python_parent_id = py_parent;
-        state.begin_emitted = false;
-        if (py_id != 0) {
-          pythonIdRemap_[py_id] = py_id;
-        }
-        // Emit SLICE_BEGIN immediately so children appear nested under it
-        emitCollapseBegin(track_key, state);
-        return true;  // suppress the original event
-      }
-    }
-    return false;  // no match, emit normally
-  }
-
-  // Active rule exists — check if current event continues the match
-  auto& rule = *state.active_rule;
-  int relative_depth = depth - state.match_start_depth + 1;
-
-  if (rule.mode == CollapseRule::PREFIX_SET) {
-    if (relative_depth > 1) {
-      if (nameMatchesPrefixes(name, rule.prefixes)) {
-        state.matched_depth = std::max(state.matched_depth, relative_depth);
-        if (py_id != 0) {
-          pythonIdRemap_[py_id] = state.collapse_python_id;
-        }
-        return true;  // suppress
-      }
-      return false;  // non-matching descendant: emit but keep collapse active
-    }
-    // relative_depth <= 1: sibling or higher of collapse root
-    if (nameMatchesPrefixes(name, rule.prefixes)) {
-      // Sibling extends the existing collapse
-      state.match_start_depth = depth;
-      state.matched_depth = 1;
-      state.collapse_end_ts = std::max(state.collapse_end_ts, end_ts);
-      if (py_id != 0) {
-        pythonIdRemap_[py_id] = state.collapse_python_id;
-      }
-      return true;  // suppress
-    }
-    // Non-matching at root level — flush and try new rules
-    flushCollapse(track_key, state);
-    for (auto& r : collapseRules_) {
-      if (ruleCanStartWith(r, name)) {
-        state.active_rule = &r;
-        state.match_start_depth = depth;
-        state.matched_depth = 1;
-        state.collapse_start_ts = ts;
-        state.collapse_end_ts = end_ts;
-        state.collapse_python_id = py_id;
-        state.collapse_python_parent_id = py_parent;
-        state.begin_emitted = false;
-        if (py_id != 0) {
-          pythonIdRemap_[py_id] = py_id;
-        }
-        emitCollapseBegin(track_key, state);
-        return true;  // suppress by new rule
-      }
-    }
-    return false;  // no rule matches, emit normally
-  } else {
-    // STRICT_PATTERN: must be exactly the next depth level and match the
-    // next pattern entry
-    if (!ruleFullyMatched(rule, state.matched_depth) &&
-        relative_depth == state.matched_depth + 1 &&
-        ruleMatchesName(rule, name, state.matched_depth)) {
-      state.matched_depth = relative_depth;
-      if (py_id != 0) {
-        pythonIdRemap_[py_id] = state.collapse_python_id;
-      }
-      return true;  // suppress
-    }
-    // If the pattern is fully matched, flush it now so other rules can start
-    if (ruleFullyMatched(rule, state.matched_depth)) {
-      flushCollapse(track_key, state);
-      // Try to start a new match with a different rule for this event
-      for (auto& r : collapseRules_) {
-        if (&r == &rule) continue;  // skip the rule we just finished
-        if (ruleCanStartWith(r, name)) {
-          state.active_rule = &r;
-          state.match_start_depth = depth;
-          state.matched_depth = 1;
-          state.collapse_start_ts = ts;
-          state.collapse_end_ts = end_ts;
-          state.collapse_python_id = py_id;
-          state.collapse_python_parent_id = py_parent;
-          state.begin_emitted = false;
+  // Match against active contexts or start new ones.
+  // The loop retries with outer contexts after flushing an inner one.
+  while (true) {
+    if (state.contexts.empty()) {
+      // No active context — try to start a new collapse
+      for (auto& rule : collapseRules_) {
+        if (ruleCanStartWith(rule, name)) {
+          CollapseContext ctx;
+          ctx.rule = &rule;
+          ctx.match_start_depth = depth;
+          ctx.matched_depth = 1;
+          ctx.collapse_start_ts = ts;
+          ctx.collapse_end_ts = end_ts;
+          ctx.collapse_python_id = py_id;
+          ctx.collapse_python_parent_id = py_parent;
+          state.contexts.push_back(ctx);
           if (py_id != 0) {
             pythonIdRemap_[py_id] = py_id;
           }
           emitCollapseBegin(track_key, state);
-          return true;  // suppress by new rule
+          return true;
         }
       }
+      return false;
     }
-  }
 
-  // Event doesn't match — emitted normally (re-parented under collapsed event).
-  return false;
+    // Save the active rule pointer before any push_back that could
+    // reallocate the contexts vector and invalidate references.
+    const CollapseRule* active_rule = state.contexts.back().rule;
+    int relative_depth =
+        depth - state.contexts.back().match_start_depth + 1;
+
+    if (active_rule->mode == CollapseRule::PREFIX_SET) {
+      if (relative_depth > 1) {
+        if (nameMatchesPrefixes(name, active_rule->prefixes)) {
+          auto& ctx = state.contexts.back();
+          ctx.matched_depth = std::max(ctx.matched_depth, relative_depth);
+          if (py_id != 0) {
+            pythonIdRemap_[py_id] = ctx.collapse_python_id;
+          }
+          return true;  // suppress by active rule
+        }
+        // Non-matching descendant — try nested collapse with other rules
+        for (auto& r : collapseRules_) {
+          if (&r == active_rule) continue;
+          if (ruleCanStartWith(r, name)) {
+            CollapseContext ctx;
+            ctx.rule = &r;
+            ctx.match_start_depth = depth;
+            ctx.matched_depth = 1;
+            ctx.collapse_start_ts = ts;
+            ctx.collapse_end_ts = end_ts;
+            ctx.collapse_python_id = py_id;
+            ctx.collapse_python_parent_id = py_parent;
+            state.contexts.push_back(ctx);
+            if (py_id != 0) {
+              pythonIdRemap_[py_id] = py_id;
+            }
+            emitCollapseBegin(track_key, state);
+            return true;  // suppress by nested rule
+          }
+        }
+        return false;  // no match, emit normally
+      }
+      // relative_depth <= 1: sibling or higher of collapse root
+      if (nameMatchesPrefixes(name, active_rule->prefixes)) {
+        auto& ctx = state.contexts.back();
+        ctx.match_start_depth = depth;
+        ctx.matched_depth = 1;
+        ctx.collapse_end_ts = std::max(ctx.collapse_end_ts, end_ts);
+        if (py_id != 0) {
+          pythonIdRemap_[py_id] = ctx.collapse_python_id;
+        }
+        return true;  // suppress — extends existing collapse
+      }
+      // Non-matching at root level — flush and retry with outer context
+      flushCollapse(track_key, state);
+      continue;
+    }
+
+    // STRICT_PATTERN
+    if (!ruleFullyMatched(*active_rule, state.contexts.back().matched_depth) &&
+        relative_depth == state.contexts.back().matched_depth + 1 &&
+        ruleMatchesName(*active_rule, name,
+                        state.contexts.back().matched_depth)) {
+      auto& ctx = state.contexts.back();
+      ctx.matched_depth = relative_depth;
+      if (py_id != 0) {
+        pythonIdRemap_[py_id] = ctx.collapse_python_id;
+      }
+      return true;  // suppress
+    }
+    if (ruleFullyMatched(*active_rule,
+                         state.contexts.back().matched_depth)) {
+      flushCollapse(track_key, state);
+      continue;  // retry with outer context or start new
+    }
+    // Doesn't extend current STRICT_PATTERN — try nested collapse
+    for (auto& r : collapseRules_) {
+      if (&r == active_rule) continue;
+      if (ruleCanStartWith(r, name)) {
+        CollapseContext ctx;
+        ctx.rule = &r;
+        ctx.match_start_depth = depth;
+        ctx.matched_depth = 1;
+        ctx.collapse_start_ts = ts;
+        ctx.collapse_end_ts = end_ts;
+        ctx.collapse_python_id = py_id;
+        ctx.collapse_python_parent_id = py_parent;
+        state.contexts.push_back(ctx);
+        if (py_id != 0) {
+          pythonIdRemap_[py_id] = py_id;
+        }
+        emitCollapseBegin(track_key, state);
+        return true;  // suppress by nested rule
+      }
+    }
+    return false;
+  }
 }
 
 void PerfettoLogger::emitCollapseBegin(
     uint64_t track_key, CollapseState& state) {
-  auto& rule = *state.active_rule;
+  auto& ctx = state.contexts.back();
 
-  uint64_t nameIid = internEventName(rule.collapsed_name);
+  uint64_t nameIid = internEventName(ctx.rule->collapsed_name);
   uint64_t catIid = internEventCategory("collapsed");
 
-  beginPacket(static_cast<uint64_t>(state.collapse_start_ts));
+  beginPacket(static_cast<uint64_t>(ctx.collapse_start_ts));
   flushPendingInterning();
   auto* event = packet_->set_track_event();
   event->set_type(TrackEvent::TYPE_SLICE_BEGIN);
@@ -334,39 +359,37 @@ void PerfettoLogger::emitCollapseBegin(
   event->set_name_iid(nameIid);
   event->add_category_iids(catIid);
 
-  if (state.collapse_python_id != 0) {
+  if (ctx.collapse_python_id != 0) {
     auto* ann = event->add_debug_annotations();
     ann->set_name("Python id");
-    ann->set_int_value(state.collapse_python_id);
+    ann->set_int_value(ctx.collapse_python_id);
   }
-  if (state.collapse_python_parent_id != 0) {
+  if (ctx.collapse_python_parent_id != 0) {
     auto* ann = event->add_debug_annotations();
     ann->set_name("Python parent id");
-    ann->set_int_value(state.collapse_python_parent_id);
+    ann->set_int_value(ctx.collapse_python_parent_id);
   }
 
   writePacket();
-  state.begin_emitted = true;
+  ctx.begin_emitted = true;
 }
 
 void PerfettoLogger::flushCollapse(uint64_t track_key, CollapseState& state) {
-  if (!state.active_rule) return;
+  if (state.contexts.empty()) return;
+  auto& ctx = state.contexts.back();
 
-  // Emit SLICE_BEGIN if not already emitted
-  if (!state.begin_emitted) {
+  if (!ctx.begin_emitted) {
     emitCollapseBegin(track_key, state);
   }
 
   // SLICE_END
-  beginPacket(static_cast<uint64_t>(state.collapse_end_ts));
+  beginPacket(static_cast<uint64_t>(ctx.collapse_end_ts));
   auto* endEvent = packet_->set_track_event();
   endEvent->set_type(TrackEvent::TYPE_SLICE_END);
   endEvent->set_track_uuid(track_key);
   writePacket();
 
-  state.active_rule = nullptr;
-  state.matched_depth = 0;
-  state.begin_emitted = false;
+  state.contexts.pop_back();
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,9 +1046,9 @@ void PerfettoLogger::finalizeTrace(
     return;
   }
 
-  // Flush any pending collapses
+  // Flush any pending collapses (innermost first)
   for (auto& [key, state] : collapseStates_) {
-    if (state.active_rule) {
+    while (!state.contexts.empty()) {
       flushCollapse(key, state);
     }
   }

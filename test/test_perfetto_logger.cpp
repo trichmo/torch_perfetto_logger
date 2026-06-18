@@ -583,5 +583,136 @@ int main() {
   std::cout << "a, b should be suppressed into 'start'." << std::endl;
   std::cout << "Open in https://ui.perfetto.dev to inspect." << std::endl;
 
+  // =====================================================================
+  // Test 5: Nested PREFIX_SET collapse — inner rule's events appear as
+  //         descendants of the outer rule with non-matching events between.
+  //         Two rules:
+  //           worker_collapse: ["multi", "vllm_worker"]
+  //           triton_collapse: ["triton_compiler", "ast_"]
+  //         Input tree:
+  //           multi (matches worker)
+  //             vllm_worker (matches worker)
+  //               plain_a (non-matching)
+  //                 plain_b (non-matching)
+  //                   triton_compiler (matches triton → nested collapse)
+  //                     ast_parse (matches triton)
+  //                     triton_compiler (matches triton)
+  //                       ast_x (matches triton)
+  //                       ast_y (matches triton)
+  //                   plain_c (non-matching)
+  //         Expected output:
+  //           worker_collapse (100..1200)
+  //             plain_a (100..1100)
+  //               plain_b (100..1000)
+  //                 triton_collapse (100..800)
+  //                 plain_c (810..950)
+  // =====================================================================
+  static const std::string kNestedOutput = "/tmp/test_nested_prefix_collapse_trace.pftrace";
+  std::cout << "\n--- Nested PREFIX_SET collapse test ---" << std::endl;
+
+  auto nlogger = std::make_unique<perfetto_logger::PerfettoLogger>(kNestedOutput);
+  nlogger->addCollapseRule(
+      {perfetto_logger::CollapseRule::PREFIX_SET,
+       {}, {"multi", "vllm_worker"}, "worker_collapse"});
+  nlogger->addCollapseRule(
+      {perfetto_logger::CollapseRule::PREFIX_SET,
+       {}, {"triton_compiler", "ast_"}, "triton_collapse"});
+
+  std::unordered_map<std::string, std::string> nmeta;
+  nlogger->handleTraceStart(nmeta, "[]");
+
+  libkineto::DeviceInfo ndev{12345, 0, "process", "CPU"};
+  nlogger->handleDeviceInfo(ndev, 0);
+  libkineto::ResourceInfo nres{42, 0, 12345, "thread 42"};
+  nlogger->handleResourceInfo(nres, 0);
+
+  libkineto::TraceSpan nspan(0, 0, "test");
+
+  // multi (root, matches worker_collapse)
+  {
+    libkineto::GenericTraceActivity act(nspan, libkineto::ActivityType::PYTHON_FUNCTION, "multi_spawn");
+    act.startTime = 100; act.endTime = 1200;
+    act.device = 12345; act.resource = 42;
+    act.log(*nlogger);
+  }
+  // vllm_worker (child, matches worker_collapse)
+  {
+    libkineto::GenericTraceActivity act(nspan, libkineto::ActivityType::PYTHON_FUNCTION, "vllm_worker_run");
+    act.startTime = 100; act.endTime = 1150;
+    act.device = 12345; act.resource = 42;
+    act.log(*nlogger);
+  }
+  // plain_a (non-matching descendant — should be EMITTED)
+  {
+    libkineto::GenericTraceActivity act(nspan, libkineto::ActivityType::PYTHON_FUNCTION, "plain_a");
+    act.startTime = 100; act.endTime = 1100;
+    act.device = 12345; act.resource = 42;
+    act.log(*nlogger);
+  }
+  // plain_b (non-matching — should be EMITTED)
+  {
+    libkineto::GenericTraceActivity act(nspan, libkineto::ActivityType::PYTHON_FUNCTION, "plain_b");
+    act.startTime = 100; act.endTime = 1000;
+    act.device = 12345; act.resource = 42;
+    act.log(*nlogger);
+  }
+  // triton_compiler (matches triton_collapse → starts nested collapse)
+  {
+    libkineto::GenericTraceActivity act(nspan, libkineto::ActivityType::PYTHON_FUNCTION, "triton_compiler_main");
+    act.startTime = 100; act.endTime = 400;
+    act.device = 12345; act.resource = 42;
+    act.log(*nlogger);
+  }
+  // ast_parse (child of triton_compiler, matches triton_collapse — SUPPRESSED)
+  {
+    libkineto::GenericTraceActivity act(nspan, libkineto::ActivityType::PYTHON_FUNCTION, "ast_parse");
+    act.startTime = 100; act.endTime = 350;
+    act.device = 12345; act.resource = 42;
+    act.log(*nlogger);
+  }
+  // triton_compiler (sibling, extends triton_collapse — SUPPRESSED)
+  {
+    libkineto::GenericTraceActivity act(nspan, libkineto::ActivityType::PYTHON_FUNCTION, "triton_compiler_opt");
+    act.startTime = 410; act.endTime = 800;
+    act.device = 12345; act.resource = 42;
+    act.log(*nlogger);
+  }
+  // ast_x (child of triton_compiler_opt, matches triton — SUPPRESSED)
+  {
+    libkineto::GenericTraceActivity act(nspan, libkineto::ActivityType::PYTHON_FUNCTION, "ast_x");
+    act.startTime = 410; act.endTime = 600;
+    act.device = 12345; act.resource = 42;
+    act.log(*nlogger);
+  }
+  // ast_y (child of triton_compiler_opt, matches triton — SUPPRESSED)
+  {
+    libkineto::GenericTraceActivity act(nspan, libkineto::ActivityType::PYTHON_FUNCTION, "ast_y");
+    act.startTime = 610; act.endTime = 790;
+    act.device = 12345; act.resource = 42;
+    act.log(*nlogger);
+  }
+  // plain_c (sibling of triton_compiler, non-matching — should be EMITTED)
+  {
+    libkineto::GenericTraceActivity act(nspan, libkineto::ActivityType::PYTHON_FUNCTION, "plain_c");
+    act.startTime = 810; act.endTime = 950;
+    act.device = 12345; act.resource = 42;
+    act.log(*nlogger);
+  }
+
+  libkineto::Config nconfig;
+  std::unordered_map<std::string, std::vector<std::string>> nfinalMeta;
+  nlogger->finalizeTrace(nconfig, nullptr, 1300, nfinalMeta);
+
+  std::ifstream ncheck(kNestedOutput, std::ios::binary | std::ios::ate);
+  if (!ncheck.is_open()) {
+    std::cerr << "FAIL: Nested PREFIX_SET output not created" << std::endl;
+    return 1;
+  }
+  auto nsize = ncheck.tellg();
+  std::cout << "OK: Nested PREFIX_SET trace wrote " << nsize << " bytes to " << kNestedOutput << std::endl;
+  std::cout << "Expected: worker_collapse (100..1200) > plain_a > plain_b > triton_collapse (100..800) + plain_c (810..950)" << std::endl;
+  std::cout << "multi_spawn, vllm_worker_run, triton_compiler_*, ast_* should all be suppressed." << std::endl;
+  std::cout << "Open in https://ui.perfetto.dev to inspect." << std::endl;
+
   return 0;
 }

@@ -139,16 +139,20 @@ class PerfettoLogger : public libkineto::ActivityLogger {
     int64_t python_parent_id = 0;
   };
 
-  struct CollapseState {
-    std::vector<CollapseStackEntry> stack;
-    const CollapseRule* active_rule = nullptr;
+  struct CollapseContext {
+    const CollapseRule* rule = nullptr;
     int matched_depth = 0;
-    int match_start_depth = 0;  // stack depth where the match began
+    int match_start_depth = 0;
     int64_t collapse_start_ts = 0;
     int64_t collapse_end_ts = 0;
     int64_t collapse_python_id = 0;
     int64_t collapse_python_parent_id = 0;
     bool begin_emitted = false;
+  };
+
+  struct CollapseState {
+    std::vector<CollapseStackEntry> stack;
+    std::vector<CollapseContext> contexts;  // nested collapse stack, innermost last
   };
 
   // Returns true if the event should be suppressed (part of an active collapse)
