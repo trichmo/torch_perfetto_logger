@@ -18,10 +18,20 @@ using libkineto::DeviceInfo;
 using libkineto::ResourceInfo;
 using libkineto::TraceSpan;
 
+struct CollapseRule {
+  enum Mode { STRICT_PATTERN, PREFIX_SET };
+  Mode mode = STRICT_PATTERN;
+  std::vector<std::string> pattern;   // for STRICT_PATTERN: ordered event names
+  std::vector<std::string> prefixes;  // for PREFIX_SET: any-match substrings
+  std::string collapsed_name;
+};
+
 class PerfettoLogger : public libkineto::ActivityLogger {
  public:
   explicit PerfettoLogger(const std::string& filename);
   ~PerfettoLogger() override;
+
+  void addCollapseRule(const CollapseRule& rule);
 
   void handleDeviceInfo(const DeviceInfo& info, int64_t time) override;
   void handleResourceInfo(const ResourceInfo& info, int64_t time) override;
@@ -118,6 +128,40 @@ class PerfettoLogger : public libkineto::ActivityLogger {
   // Track dedup
   std::unordered_set<uint64_t> emittedTracks_;
   std::unordered_set<int64_t> syncStreamEmitted_;
+
+  // --- Collapse support ---
+
+  struct CollapseStackEntry {
+    std::string name;
+    int64_t ts;
+    int64_t end_ts;
+    int64_t python_id = 0;
+    int64_t python_parent_id = 0;
+  };
+
+  struct CollapseState {
+    std::vector<CollapseStackEntry> stack;
+    const CollapseRule* active_rule = nullptr;
+    int matched_depth = 0;
+    int match_start_depth = 0;  // stack depth where the match began
+    int64_t collapse_start_ts = 0;
+    int64_t collapse_end_ts = 0;
+    int64_t collapse_python_id = 0;
+    int64_t collapse_python_parent_id = 0;
+    bool begin_emitted = false;
+  };
+
+  // Returns true if the event should be suppressed (part of an active collapse)
+  bool processCollapse(
+      uint64_t track_key, const libkineto::ITraceActivity& op,
+      int64_t ts, int64_t end_ts);
+  void emitCollapseBegin(uint64_t track_key, CollapseState& state);
+  void flushCollapse(uint64_t track_key, CollapseState& state);
+
+  std::vector<CollapseRule> collapseRules_;
+  std::unordered_map<uint64_t, CollapseState> collapseStates_;
+  // Maps suppressed Python id → collapsed event's Python id
+  std::unordered_map<int64_t, int64_t> pythonIdRemap_;
 };
 
 }  // namespace perfetto_logger

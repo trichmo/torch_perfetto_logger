@@ -234,6 +234,247 @@ int main() {
   }
 
   std::cout << "OK: Wrote " << size << " bytes to " << kOutputPath << std::endl;
-  std::cout << "Open in https://ui.perfetto.dev to inspect the trace." << std::endl;
+
+  // =====================================================================
+  // Test 2: Collapse rules
+  // =====================================================================
+  static const std::string kCollapseOutput = "/tmp/test_collapse_trace.pftrace";
+  std::cout << "\n--- Collapse test ---" << std::endl;
+
+  auto clogger = std::make_unique<perfetto_logger::PerfettoLogger>(kCollapseOutput);
+  clogger->addCollapseRule(
+      {perfetto_logger::CollapseRule::STRICT_PATTERN,
+       {"a_fn", "b_fn", "a_fn1"}, {}, "my_collapsed"});
+
+  std::unordered_map<std::string, std::string> cmeta;
+  clogger->handleTraceStart(cmeta, "[]");
+
+  libkineto::DeviceInfo cdev{12345, 0, "process", "CPU"};
+  clogger->handleDeviceInfo(cdev, 0);
+  libkineto::ResourceInfo cres{42, 0, 12345, "thread 42"};
+  clogger->handleResourceInfo(cres, 0);
+
+  libkineto::TraceSpan cspan(0, 0, "test");
+
+  // Nested events matching the collapse pattern: a_fn > b_fn > a_fn1
+  // a_fn: t=100..600 (outermost)
+  {
+    libkineto::GenericTraceActivity act(cspan, libkineto::ActivityType::PYTHON_FUNCTION, "a_fn");
+    act.startTime = 100; act.endTime = 600;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 10);
+    act.addMetadataQuoted("Python parent id", "null");
+    act.log(*clogger);
+  }
+  // b_fn: t=100..500 (child of a_fn)
+  {
+    libkineto::GenericTraceActivity act(cspan, libkineto::ActivityType::PYTHON_FUNCTION, "b_fn");
+    act.startTime = 100; act.endTime = 500;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 11);
+    act.addMetadata("Python parent id", 10);
+    act.log(*clogger);
+  }
+  // a_fn1: t=110..400 (child of b_fn — completes the pattern)
+  {
+    libkineto::GenericTraceActivity act(cspan, libkineto::ActivityType::PYTHON_FUNCTION, "a_fn1");
+    act.startTime = 110; act.endTime = 400;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 12);
+    act.addMetadata("Python parent id", 11);
+    act.log(*clogger);
+  }
+  // Sibling event under b_fn (not part of pattern, should be emitted)
+  {
+    libkineto::GenericTraceActivity act(cspan, libkineto::ActivityType::PYTHON_FUNCTION, "b_fn_sub");
+    act.startTime = 120; act.endTime = 350;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 13);
+    act.addMetadata("Python parent id", 12);  // parent is suppressed a_fn1
+    act.log(*clogger);
+  }
+
+  // Unrelated event after the collapse (should emit normally)
+  {
+    libkineto::GenericTraceActivity act(cspan, libkineto::ActivityType::CPU_OP, "unrelated_op");
+    act.startTime = 700; act.endTime = 800;
+    act.device = 12345; act.resource = 42;
+    act.log(*clogger);
+  }
+
+  libkineto::Config cconfig;
+  std::unordered_map<std::string, std::vector<std::string>> cfinalMeta;
+  clogger->finalizeTrace(cconfig, nullptr, 1000, cfinalMeta);
+
+  std::ifstream ccheck(kCollapseOutput, std::ios::binary | std::ios::ate);
+  if (!ccheck.is_open()) {
+    std::cerr << "FAIL: Collapse output not created" << std::endl;
+    return 1;
+  }
+  auto csize = ccheck.tellg();
+  std::cout << "OK: Collapse trace wrote " << csize << " bytes to " << kCollapseOutput << std::endl;
+  std::cout << "Expected: 'my_collapsed' event (t=100..600), 'b_fn_sub' (t=120..350), 'unrelated_op' (t=700..800)" << std::endl;
+  std::cout << "Open in https://ui.perfetto.dev to inspect." << std::endl;
+
+  // =====================================================================
+  // Test 3: PREFIX_SET collapse — non-matching descendants stay, matching
+  //         descendants at any depth are suppressed
+  // =====================================================================
+  static const std::string kPrefixOutput = "/tmp/test_prefix_collapse_trace.pftrace";
+  std::cout << "\n--- PREFIX_SET collapse test ---" << std::endl;
+
+  auto plogger = std::make_unique<perfetto_logger::PerfettoLogger>(kPrefixOutput);
+  plogger->addCollapseRule(
+      {perfetto_logger::CollapseRule::PREFIX_SET,
+       {}, {"torch_", "autograd_"}, "matched_"});
+
+  std::unordered_map<std::string, std::string> pmeta;
+  plogger->handleTraceStart(pmeta, "[]");
+
+  libkineto::DeviceInfo pdev{12345, 0, "process", "CPU"};
+  plogger->handleDeviceInfo(pdev, 0);
+  libkineto::ResourceInfo pres{42, 0, 12345, "thread 42"};
+  plogger->handleResourceInfo(pres, 0);
+
+  libkineto::TraceSpan pspan(0, 0, "test");
+
+  // Tree structure:
+  //   torch_          100──────────────────────────1000
+  //    autograd_      100────────────────────900
+  //      torch_       100──200
+  //      other_            210──300
+  //      another_               310──400
+  //    ignore_ (leaf)                410─450
+  //    ignore_                           460──────900
+  //      autograd_                       460─────890
+  //        torch_                        460────880
+  //          autograd_                   460───870
+  //            torch_                    460─550
+  //            torch_                         560─650
+
+  // torch_ (root)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "torch_root");
+    act.startTime = 100; act.endTime = 1000;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 1);
+    act.addMetadataQuoted("Python parent id", "null");
+    act.log(*plogger);
+  }
+  // autograd_ (child of torch_)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "autograd_dispatch");
+    act.startTime = 100; act.endTime = 900;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 2);
+    act.addMetadata("Python parent id", 1);
+    act.log(*plogger);
+  }
+  // torch_ (inner, child of autograd_)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "torch_inner");
+    act.startTime = 100; act.endTime = 200;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 3);
+    act.addMetadata("Python parent id", 2);
+    act.log(*plogger);
+  }
+  // other_ (sibling of torch_ inner, non-matching — should be EMITTED)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "other_work");
+    act.startTime = 210; act.endTime = 300;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 4);
+    act.addMetadata("Python parent id", 2);
+    act.log(*plogger);
+  }
+  // another_ (sibling, non-matching — should be EMITTED)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "another_task");
+    act.startTime = 310; act.endTime = 400;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 5);
+    act.addMetadata("Python parent id", 2);
+    act.log(*plogger);
+  }
+  // ignore_ (leaf, child of torch_ root, non-matching — should be EMITTED)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "ignore_leaf");
+    act.startTime = 410; act.endTime = 450;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 6);
+    act.addMetadata("Python parent id", 1);
+    act.log(*plogger);
+  }
+  // ignore_ (parent, child of torch_ root, non-matching — should be EMITTED)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "ignore_parent");
+    act.startTime = 460; act.endTime = 900;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 7);
+    act.addMetadata("Python parent id", 1);
+    act.log(*plogger);
+  }
+  // autograd_ (under ignore_, matching — should be SUPPRESSED)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "autograd_deep");
+    act.startTime = 460; act.endTime = 890;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 8);
+    act.addMetadata("Python parent id", 7);
+    act.log(*plogger);
+  }
+  // torch_ (under autograd_ deep)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "torch_deep1");
+    act.startTime = 460; act.endTime = 880;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 9);
+    act.addMetadata("Python parent id", 8);
+    act.log(*plogger);
+  }
+  // autograd_ (under torch_ deep1)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "autograd_deep2");
+    act.startTime = 460; act.endTime = 870;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 10);
+    act.addMetadata("Python parent id", 9);
+    act.log(*plogger);
+  }
+  // torch_ (first child of autograd_deep2)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "torch_leaf1");
+    act.startTime = 460; act.endTime = 550;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 11);
+    act.addMetadata("Python parent id", 10);
+    act.log(*plogger);
+  }
+  // torch_ (second child of autograd_deep2, sibling of above)
+  {
+    libkineto::GenericTraceActivity act(pspan, libkineto::ActivityType::PYTHON_FUNCTION, "torch_leaf2");
+    act.startTime = 560; act.endTime = 650;
+    act.device = 12345; act.resource = 42;
+    act.addMetadata("Python id", 12);
+    act.addMetadata("Python parent id", 10);
+    act.log(*plogger);
+  }
+
+  libkineto::Config pconfig;
+  std::unordered_map<std::string, std::vector<std::string>> pfinalMeta;
+  plogger->finalizeTrace(pconfig, nullptr, 1100, pfinalMeta);
+
+  std::ifstream pcheck(kPrefixOutput, std::ios::binary | std::ios::ate);
+  if (!pcheck.is_open()) {
+    std::cerr << "FAIL: PREFIX_SET output not created" << std::endl;
+    return 1;
+  }
+  auto psize = pcheck.tellg();
+  std::cout << "OK: PREFIX_SET trace wrote " << psize << " bytes to " << kPrefixOutput << std::endl;
+  std::cout << "Expected: 'matched_' (100..1000) with children: other_work, another_task, ignore_leaf, ignore_parent" << std::endl;
+  std::cout << "All torch_*/autograd_* events should be suppressed." << std::endl;
+  std::cout << "Open in https://ui.perfetto.dev to inspect." << std::endl;
+
   return 0;
 }
